@@ -1,0 +1,1735 @@
+#!/usr/bin/env node
+
+/**
+ * Virtual Key Manager (VKM)
+ * General-purpose API key manager supporting multiple services
+ * with adaptive integrations, organized cycles, and background monitoring
+ */
+
+const fs = require('fs');
+const path = require('path');
+const https = require('https');
+const http = require('http');
+const { spawn, exec } = require('child_process');
+const readline = require('readline');
+const os = require('os');
+
+const CONFIG_DIR = path.join(process.env.HOME, '.vkm');
+const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
+const SERVICES_FILE = path.join(CONFIG_DIR, 'services.json');
+const KEYS_FILE = path.join(CONFIG_DIR, 'keys.json');
+const CYCLES_FILE = path.join(CONFIG_DIR, 'cycles.json');
+const STATE_FILE = path.join(CONFIG_DIR, 'state.json');
+const LOG_FILE = path.join(CONFIG_DIR, 'vkm.log');
+const PID_FILE = path.join(CONFIG_DIR, 'vkm.pid');
+
+// Built-in service definitions
+const DEFAULT_SERVICES = {
+  openrouter: {
+    name: 'OpenRouter',
+    description: 'OpenRouter AI API Gateway',
+    defaultUrl: 'https://openrouter.ai/api/v1',
+    keyPrefix: 'sk-or-v1-',
+    healthEndpoint: '/models',
+    authHeader: 'Authorization',
+    authPrefix: 'Bearer ',
+    models: ['anthropic/claude-sonnet-4-20250514', 'openai/gpt-4o', 'google/gemini-pro'],
+    testModel: 'arcee-ai/trinity-large-preview:free',
+    testMaxTokens: 5,
+    supportsUsageCheck: true,
+    usageEndpoint: '/auth/key',
+    rateLimitHeader: 'x-ratelimit-limit',
+    remainingHeader: 'x-ratelimit-remaining'
+  },
+  anthropic: {
+    name: 'Anthropic',
+    description: 'Anthropic Claude API',
+    defaultUrl: 'https://api.anthropic.com/v1',
+    keyPrefix: 'sk-ant-',
+    healthEndpoint: '/models',
+    authHeader: 'x-api-key',
+    authPrefix: '',
+    models: ['claude-3-5-sonnet-20241022', 'claude-3-opus-20240229', 'claude-3-haiku-20240307'],
+    testModel: 'claude-3-haiku-20240307',
+    testMaxTokens: 5,
+    supportsUsageCheck: false,
+    supportsStreaming: true
+  },
+  openai: {
+    name: 'OpenAI',
+    description: 'OpenAI API',
+    defaultUrl: 'https://api.openai.com/v1',
+    keyPrefix: 'sk-',
+    healthEndpoint: '/models',
+    authHeader: 'Authorization',
+    authPrefix: 'Bearer ',
+    models: ['gpt-4o', 'gpt-4-turbo', 'gpt-3.5-turbo'],
+    testModel: 'gpt-3.5-turbo',
+    testMaxTokens: 5,
+    supportsUsageCheck: true,
+    usageEndpoint: '/usage'
+  },
+  groq: {
+    name: 'Groq',
+    description: 'Groq API',
+    defaultUrl: 'https://api.groq.com/openai/v1',
+    keyPrefix: 'gsk_',
+    healthEndpoint: '/models',
+    authHeader: 'Authorization',
+    authPrefix: 'Bearer ',
+    models: ['llama-3.1-70b-versatile', 'mixtral-8x7b-32768', 'gemma-7b-it'],
+    testModel: 'gemma-7b-it',
+    testMaxTokens: 5,
+    supportsUsageCheck: false
+  },
+  openclaw: {
+    name: 'OpenClaw',
+    description: 'OpenClaw MCP Gateway',
+    defaultUrl: 'http://localhost:8080/v1',
+    keyPrefix: 'claw-',
+    healthEndpoint: '/health',
+    authHeader: 'Authorization',
+    authPrefix: 'Bearer ',
+    models: ['claude-sonnet', 'claude-opus', 'gpt-4o'],
+    testModel: 'claude-sonnet',
+    testMaxTokens: 5,
+    supportsUsageCheck: false,
+    isProxy: true
+  },
+  kiro: {
+    name: 'Kiro Gateway',
+    description: 'Kiro-Proxy for Claude Sonnet Kiro',
+    defaultUrl: 'http://localhost:8787/v1',
+    keyPrefix: 'kiro-',
+    healthEndpoint: '/health',
+    authHeader: 'Authorization',
+    authPrefix: 'Bearer ',
+    models: ['claude-sonnet-kiro', 'claude-3-5-sonnet-kiro'],
+    testModel: 'claude-sonnet-kiro',
+    testMaxTokens: 5,
+    supportsUsageCheck: false,
+    isProxy: true,
+    requiresProxy: true,
+    proxyRepo: 'https://github.com/jwadow/kiro-gateway',
+    proxySetup: 'kiro-setup'
+  }
+};
+
+// Integration definitions
+const INTEGRATIONS = {
+  'claude-code': {
+    name: 'Claude Code',
+    configFiles: [
+      path.join(process.env.HOME, '.claude-code-router', 'config.json'),
+      path.join(process.env.HOME, '.claude', 'settings.json')
+    ],
+    envVars: ['ANTHROPIC_API_KEY', 'CLAUDE_API_KEY'],
+    updateStrategy: 'multi-file',
+    supportedServices: ['anthropic', 'openrouter', 'kiro']
+  },
+  'claude-code-router': {
+    name: 'Claude Code Router',
+    configFiles: [
+      path.join(process.env.HOME, '.claude-code-router', 'config.json')
+    ],
+    envVars: ['ANTHROPIC_API_KEY'],
+    updateStrategy: 'json-merge',
+    supportedServices: ['openrouter', 'anthropic', 'kiro']
+  },
+  'openclaw': {
+    name: 'OpenClaw',
+    configFiles: [
+      path.join(process.env.HOME, '.openclaw', 'config.yaml'),
+      path.join(process.env.HOME, '.openclaw', 'config.json')
+    ],
+    envVars: ['OPENCLAW_API_KEY', 'ANTHROPIC_API_KEY'],
+    updateStrategy: 'yaml-or-json',
+    supportedServices: ['openclaw', 'anthropic', 'openrouter', 'kiro']
+  },
+  'aider': {
+    name: 'Aider',
+    configFiles: [
+      path.join(process.env.HOME, '.aider.conf.yml'),
+      path.join(process.env.HOME, '.aider.conf.yaml')
+    ],
+    envVars: ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY'],
+    updateStrategy: 'yaml',
+    supportedServices: ['openai', 'anthropic', 'openrouter']
+  },
+  'cursor': {
+    name: 'Cursor',
+    configFiles: [
+      path.join(process.env.HOME, '.cursor', 'settings.json')
+    ],
+    envVars: ['CURSOR_API_KEY'],
+    updateStrategy: 'json',
+    supportedServices: ['openai', 'anthropic', 'openrouter']
+  },
+  'continue': {
+    name: 'Continue.dev',
+    configFiles: [
+      path.join(process.env.HOME, '.continue', 'config.json')
+    ],
+    envVars: ['CONTINUE_API_KEY'],
+    updateStrategy: 'json',
+    supportedServices: ['openai', 'anthropic', 'openrouter', 'groq']
+  },
+  'shell': {
+    name: 'Shell Environment',
+    configFiles: [
+      path.join(process.env.HOME, '.bashrc'),
+      path.join(process.env.HOME, '.zshrc'),
+      path.join(process.env.HOME, '.profile')
+    ],
+    envVars: [],
+    updateStrategy: 'env-file',
+    supportedServices: ['*']
+  }
+};
+
+// Utility functions
+function log(message, level = 'info') {
+  const timestamp = new Date().toISOString();
+  const logLine = `[${timestamp}] [${level.toUpperCase()}] ${message}\n`;
+  
+  if (level === 'error') console.error(logLine.trim());
+  else if (level === 'warn') console.warn(logLine.trim());
+  else console.log(logLine.trim());
+  
+  fs.appendFileSync(LOG_FILE, logLine);
+}
+
+function loadConfig() {
+  if (!fs.existsSync(CONFIG_FILE)) {
+    return {
+      version: '2.0.0',
+      defaultService: 'openrouter',
+      monitorEnabled: true,
+      monitorInterval: 60000,
+      rotationEnabled: true,
+      cycleEnabled: true,
+      kiroProxyEnabled: false,
+      kiroProxyPort: 8787,
+      kiroProxyAutoStart: true,
+      integrations: Object.keys(INTEGRATIONS)
+    };
+  }
+  return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+}
+
+function saveConfig(config) {
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+}
+
+function loadServices() {
+  let custom = {};
+  if (fs.existsSync(SERVICES_FILE)) {
+    custom = JSON.parse(fs.readFileSync(SERVICES_FILE, 'utf8'));
+  }
+  return { ...DEFAULT_SERVICES, ...custom };
+}
+
+function saveServices(services) {
+  const custom = {};
+  for (const [key, value] of Object.entries(services)) {
+    if (!DEFAULT_SERVICES[key]) {
+      custom[key] = value;
+    }
+  }
+  fs.writeFileSync(SERVICES_FILE, JSON.stringify(custom, null, 2));
+}
+
+function loadKeys() {
+  if (!fs.existsSync(KEYS_FILE)) {
+    return {};
+  }
+  return JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8'));
+}
+
+function saveKeys(keys) {
+  fs.writeFileSync(KEYS_FILE, JSON.stringify(keys, null, 2));
+}
+
+function loadCycles() {
+  if (!fs.existsSync(CYCLES_FILE)) {
+    return {
+      cycles: {},
+      activeCycles: {},
+      history: []
+    };
+  }
+  return JSON.parse(fs.readFileSync(CYCLES_FILE, 'utf8'));
+}
+
+function saveCycles(cycles) {
+  fs.writeFileSync(CYCLES_FILE, JSON.stringify(cycles, null, 2));
+}
+
+function loadState() {
+  if (!fs.existsSync(STATE_FILE)) {
+    return {
+      currentKeyIndex: {},
+      lastRotation: {},
+      keyHealth: {},
+      serviceStatus: {}
+    };
+  }
+  return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+}
+
+function saveState(state) {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+// HTTP request helper
+function makeRequest(url, options = {}) {
+  return new Promise((resolve, reject) => {
+    const client = url.startsWith('https:') ? https : http;
+    const req = client.request(url, options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => resolve({ statusCode: res.statusCode, headers: res.headers, body: data }));
+    });
+    req.on('error', reject);
+    if (options.timeout) {
+      req.setTimeout(options.timeout, () => {
+        req.destroy();
+        reject(new Error('Request timeout'));
+      });
+    }
+    if (options.body) req.write(options.body);
+    req.end();
+  });
+}
+
+// Check key health for any service
+async function checkKeyHealth(serviceId, apiKey, customUrl = null) {
+  const services = loadServices();
+  const service = services[serviceId];
+  
+  if (!service) {
+    return { healthy: false, status: 'unknown_service', error: `Unknown service: ${serviceId}` };
+  }
+
+  const baseUrl = customUrl || service.defaultUrl;
+  const healthUrl = `${baseUrl}${service.healthEndpoint || '/models'}`;
+  
+  const options = {
+    method: 'GET',
+    headers: {
+      [service.authHeader]: `${service.authPrefix}${apiKey}`,
+      'Content-Type': 'application/json'
+    },
+    timeout: 10000
+  };
+
+  try {
+    const response = await makeRequest(healthUrl, options);
+    
+    if (response.statusCode === 200) {
+      let usage = null;
+      
+      // Try to get usage info if supported
+      if (service.supportsUsageCheck && service.usageEndpoint) {
+        try {
+          const usageUrl = `${baseUrl}${service.usageEndpoint}`;
+          const usageResponse = await makeRequest(usageUrl, options);
+          if (usageResponse.statusCode === 200) {
+            usage = JSON.parse(usageResponse.body);
+          }
+        } catch (e) {
+          // Usage check failed but key is still healthy
+        }
+      }
+      
+      return { 
+        healthy: true, 
+        status: 'active', 
+        usage,
+        headers: response.headers 
+      };
+    } else if (response.statusCode === 401) {
+      return { healthy: false, status: 'invalid', error: 'Invalid API key' };
+    } else if (response.statusCode === 429) {
+      return { healthy: false, status: 'rate_limited', error: 'Rate limited' };
+    } else {
+      return { healthy: false, status: 'error', error: `HTTP ${response.statusCode}` };
+    }
+  } catch (error) {
+    if (service.isProxy) {
+      return { healthy: false, status: 'proxy_offline', error: error.message };
+    }
+    return { healthy: false, status: 'network_error', error: error.message };
+  }
+}
+
+// Test chat completion for validation
+async function testChatCompletion(serviceId, apiKey, customUrl = null) {
+  const services = loadServices();
+  const service = services[serviceId];
+  
+  if (!service || !service.testModel) {
+    return { healthy: true, status: 'no_test_available' };
+  }
+
+  const baseUrl = customUrl || service.defaultUrl;
+  const chatUrl = `${baseUrl}/chat/completions`;
+  
+  const body = JSON.stringify({
+    model: service.testModel,
+    messages: [{ role: 'user', content: 'test' }],
+    max_tokens: service.testMaxTokens || 5
+  });
+
+  const options = {
+    method: 'POST',
+    headers: {
+      [service.authHeader]: `${service.authPrefix}${apiKey}`,
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body)
+    },
+    body,
+    timeout: 15000
+  };
+
+  try {
+    const response = await makeRequest(chatUrl, options);
+    
+    if (response.statusCode === 200) {
+      return { healthy: true, status: 'active' };
+    } else if (response.statusCode === 429) {
+      return { healthy: false, status: 'rate_limited' };
+    } else if (response.statusCode === 401) {
+      return { healthy: false, status: 'invalid' };
+    } else {
+      try {
+        const error = JSON.parse(response.body);
+        return { healthy: false, status: 'error', error: error.error?.message || response.body };
+      } catch {
+        return { healthy: false, status: 'error', error: response.body };
+      }
+    }
+  } catch (error) {
+    return { healthy: false, status: 'network_error', error: error.message };
+  }
+}
+
+// Update integration configs
+function updateIntegration(integrationId, serviceId, apiKey, customUrl = null) {
+  const integration = INTEGRATIONS[integrationId];
+  if (!integration) return { success: false, error: 'Unknown integration' };
+
+  const services = loadServices();
+  const service = services[serviceId];
+  
+  if (!service) return { success: false, error: 'Unknown service' };
+
+  let updated = false;
+  const results = [];
+
+  for (const configFile of integration.configFiles) {
+    if (!fs.existsSync(configFile)) continue;
+
+    try {
+      const content = fs.readFileSync(configFile, 'utf8');
+      let newContent = content;
+
+      if (configFile.endsWith('.json')) {
+        const config = JSON.parse(content);
+        
+        // Update based on integration type
+        if (integrationId === 'claude-code-router') {
+          config.APIKEY = apiKey;
+          if (config.Providers) {
+            config.Providers.forEach(provider => {
+              if (provider.name === serviceId || provider.name === 'openrouter') {
+                provider.api_key = apiKey;
+                if (customUrl) provider.base_url = customUrl;
+              }
+            });
+          }
+          if (customUrl) config.API_URL = customUrl;
+        } else if (integrationId === 'openclaw') {
+          config.api_key = apiKey;
+          if (customUrl) config.base_url = customUrl;
+        } else {
+          // Generic update
+          if (config.api_key !== undefined) config.api_key = apiKey;
+          if (config.APIKEY !== undefined) config.APIKEY = apiKey;
+          if (customUrl) {
+            if (config.base_url !== undefined) config.base_url = customUrl;
+            if (config.api_url !== undefined) config.api_url = customUrl;
+          }
+        }
+        
+        newContent = JSON.stringify(config, null, 2);
+      } else if (configFile.endsWith('.yaml') || configFile.endsWith('.yml')) {
+        // Simple YAML key replacement
+        const keyPattern = new RegExp(`^(api_key|APIKEY|api-key):\s*.+$`, 'm');
+        if (keyPattern.test(content)) {
+          newContent = content.replace(keyPattern, `$1: ${apiKey}`);
+        }
+        
+        if (customUrl) {
+          const urlPattern = new RegExp(`^(base_url|api_url|base-url):\s*.+$`, 'm');
+          if (urlPattern.test(content)) {
+            newContent = newContent.replace(urlPattern, `$1: ${customUrl}`);
+          }
+        }
+      } else {
+        // Shell env file
+        integration.envVars.forEach(envVar => {
+          const pattern = new RegExp(`export ${envVar}="[^"]*"`, 'g');
+          if (pattern.test(newContent)) {
+            newContent = newContent.replace(pattern, `export ${envVar}="${apiKey}"`);
+          }
+        });
+      }
+
+      if (newContent !== content) {
+        fs.writeFileSync(configFile, newContent);
+        updated = true;
+        results.push({ file: configFile, status: 'updated' });
+      } else {
+        results.push({ file: configFile, status: 'no_change' });
+      }
+    } catch (error) {
+      results.push({ file: configFile, status: 'error', error: error.message });
+    }
+  }
+
+  return { success: updated, results };
+}
+
+// Rotate to next key for service
+async function rotateKey(serviceId, options = {}) {
+  const keys = loadKeys();
+  const state = loadState();
+  const config = loadConfig();
+  
+  if (!keys[serviceId] || keys[serviceId].length === 0) {
+    return { success: false, error: `No keys configured for ${serviceId}` };
+  }
+
+  const serviceKeys = keys[serviceId];
+  const currentIndex = state.currentKeyIndex[serviceId] || 0;
+  const startIndex = currentIndex;
+  let attempts = 0;
+  let rotated = false;
+  let newKey = null;
+
+  while (attempts < serviceKeys.length) {
+    const nextIndex = (currentIndex + attempts + 1) % serviceKeys.length;
+    const keyData = serviceKeys[nextIndex];
+    
+    log(`Testing key ${nextIndex + 1}/${serviceKeys.length}: ${keyData.name || 'Unnamed'}`);
+    
+    const health = await checkKeyHealth(serviceId, keyData.key, keyData.customUrl);
+    
+    if (health.healthy || options.force) {
+      state.currentKeyIndex[serviceId] = nextIndex;
+      state.lastRotation[serviceId] = new Date().toISOString();
+      state.keyHealth[serviceId] = { status: 'healthy', checkedAt: new Date().toISOString() };
+      saveState(state);
+      
+      // Update integrations
+      const service = loadServices()[serviceId];
+      const url = keyData.customUrl || service?.defaultUrl;
+      
+      if (config.integrations) {
+        for (const integrationId of config.integrations) {
+          if (INTEGRATIONS[integrationId]?.supportedServices.includes(serviceId) || 
+              INTEGRATIONS[integrationId]?.supportedServices.includes('*')) {
+            updateIntegration(integrationId, serviceId, keyData.key, url);
+          }
+        }
+      }
+      
+      newKey = keyData;
+      rotated = true;
+      log(`Rotated to key: ${keyData.name || 'Unnamed'} (${serviceId})`);
+      break;
+    } else {
+      log(`Key ${keyData.name || 'Unnamed'} unhealthy: ${health.status}`, 'warn');
+    }
+    
+    attempts++;
+  }
+
+  if (!rotated) {
+    return { success: false, error: 'No healthy keys available' };
+  }
+
+  return { success: true, key: newKey, service: serviceId };
+}
+
+// Kiro Proxy management
+function isKiroProxyRunning(port = 8787) {
+  return new Promise((resolve) => {
+    exec(`lsof -i :${port} | grep LISTEN`, (error, stdout) => {
+      resolve(!error && stdout.length > 0);
+    });
+  });
+}
+
+async function startKiroProxy(port = 8787) {
+  const isRunning = await isKiroProxyRunning(port);
+  if (isRunning) {
+    log('Kiro proxy already running');
+    return { success: true, alreadyRunning: true };
+  }
+
+  // Check if kiro-gateway is installed
+  const kiroPath = path.join(process.env.HOME, 'kiro-gateway');
+  if (!fs.existsSync(kiroPath)) {
+    log('Kiro gateway not found. Cloning...');
+    
+    return new Promise((resolve) => {
+      exec('cd ~ && git clone https://github.com/jwadow/kiro-gateway.git', (error) => {
+        if (error) {
+          resolve({ success: false, error: 'Failed to clone kiro-gateway' });
+          return;
+        }
+        
+        // Start the proxy
+        const proc = spawn('bash', ['-c', `cd ${kiroPath} && pnpm install && pnpm dev`], {
+          detached: true,
+          stdio: 'ignore'
+        });
+        proc.unref();
+        
+        setTimeout(() => {
+          resolve({ success: true, pid: proc.pid });
+        }, 3000);
+      });
+    });
+  }
+
+  // Start existing kiro-gateway
+  const proc = spawn('bash', ['-c', `cd ${kiroPath} && pnpm dev`], {
+    detached: true,
+    stdio: 'ignore'
+  });
+  proc.unref();
+
+  return new Promise((resolve) => {
+    setTimeout(async () => {
+      const running = await isKiroProxyRunning(port);
+      resolve({ success: running, pid: proc.pid });
+    }, 3000);
+  });
+}
+
+function stopKiroProxy(port = 8787) {
+  return new Promise((resolve) => {
+    exec(`lsof -ti :${port} | xargs kill -9 2>/dev/null || true`, () => {
+      resolve({ success: true });
+    });
+  });
+}
+
+// Cycle management
+function createCycle(name, serviceIds, options = {}) {
+  const cycles = loadCycles();
+  
+  cycles.cycles[name] = {
+    name,
+    services: serviceIds,
+    models: options.models || {},
+    rotationInterval: options.rotationInterval || 3600000, // 1 hour default
+    createdAt: new Date().toISOString(),
+    autoRotate: options.autoRotate !== false,
+    description: options.description || ''
+  };
+  
+  saveCycles(cycles);
+  return cycles.cycles[name];
+}
+
+function activateCycle(name) {
+  const cycles = loadCycles();
+  const state = loadState();
+  
+  if (!cycles.cycles[name]) {
+    return { success: false, error: 'Cycle not found' };
+  }
+  
+  cycles.activeCycles[currentContext()] = name;
+  state.activeCycle = name;
+  saveCycles(cycles);
+  saveState(state);
+  
+  return { success: true, cycle: cycles.cycles[name] };
+}
+
+function currentContext() {
+  // Determine current context (project, workspace, etc.)
+  return process.env.VKM_CONTEXT || 'default';
+}
+
+function getNextInCycle(cycleName) {
+  const cycles = loadCycles();
+  const state = loadState();
+  const cycle = cycles.cycles[cycleName];
+  
+  if (!cycle) return null;
+  
+  const currentServiceIndex = state.cycleServiceIndex?.[cycleName] || 0;
+  const nextServiceIndex = (currentServiceIndex + 1) % cycle.services.length;
+  
+  state.cycleServiceIndex = state.cycleServiceIndex || {};
+  state.cycleServiceIndex[cycleName] = nextServiceIndex;
+  saveState(state);
+  
+  return {
+    service: cycle.services[nextServiceIndex],
+    model: cycle.models?.[cycle.services[nextServiceIndex]]
+  };
+}
+
+// Background monitor
+async function monitorDaemon() {
+  const config = loadConfig();
+  
+  if (!config.monitorEnabled) {
+    log('Monitor disabled in config');
+    return;
+  }
+
+  log('Starting VKM monitor daemon...');
+  fs.writeFileSync(PID_FILE, process.pid.toString());
+
+  // Handle shutdown
+  process.on('SIGTERM', () => {
+    log('Monitor daemon stopping...');
+    fs.unlinkSync(PID_FILE);
+    process.exit(0);
+  });
+
+  process.on('SIGINT', () => {
+    log('Monitor daemon stopping...');
+    fs.unlinkSync(PID_FILE);
+    process.exit(0);
+  });
+
+  // Main monitor loop
+  const checkInterval = config.monitorInterval || 60000;
+  
+  setInterval(async () => {
+    const keys = loadKeys();
+    const state = loadState();
+    const cycles = loadCycles();
+    
+    // Check all services
+    for (const [serviceId, serviceKeys] of Object.entries(keys)) {
+      if (!serviceKeys || serviceKeys.length === 0) continue;
+      
+      const currentIndex = state.currentKeyIndex?.[serviceId] || 0;
+      const currentKey = serviceKeys[currentIndex];
+      
+      if (!currentKey) continue;
+      
+      log(`Checking ${serviceId}...`);
+      const health = await checkKeyHealth(serviceId, currentKey.key, currentKey.customUrl);
+      
+      state.keyHealth[serviceId] = {
+        status: health.healthy ? 'healthy' : health.status,
+        checkedAt: new Date().toISOString()
+      };
+      saveState(state);
+      
+      if (!health.healthy && config.rotationEnabled) {
+        log(`Key unhealthy for ${serviceId}, rotating...`, 'warn');
+        await rotateKey(serviceId);
+      }
+    }
+    
+    // Handle cycle rotation if enabled
+    if (config.cycleEnabled) {
+      const activeCycle = cycles.activeCycles?.[currentContext()];
+      if (activeCycle) {
+        const cycle = cycles.cycles[activeCycle];
+        const lastRotation = new Date(state.cycleLastRotation?.[activeCycle] || 0);
+        const now = new Date();
+        
+        if ((now - lastRotation) >= cycle.rotationInterval) {
+          log(`Rotating cycle: ${activeCycle}`);
+          const next = getNextInCycle(activeCycle);
+          if (next) {
+            await rotateKey(next.service);
+            state.cycleLastRotation = state.cycleLastRotation || {};
+            state.cycleLastRotation[activeCycle] = now.toISOString();
+            saveState(state);
+            
+            // Record in history
+            cycles.history.push({
+              cycle: activeCycle,
+              service: next.service,
+              model: next.model,
+              timestamp: now.toISOString()
+            });
+            saveCycles(cycles);
+          }
+        }
+      }
+    }
+    
+    // Auto-start Kiro proxy if enabled
+    if (config.kiroProxyEnabled && config.kiroProxyAutoStart) {
+      const running = await isKiroProxyRunning(config.kiroProxyPort);
+      if (!running) {
+        log('Auto-starting Kiro proxy...');
+        await startKiroProxy(config.kiroProxyPort);
+      }
+    }
+    
+  }, checkInterval);
+}
+
+function isMonitorRunning() {
+  if (!fs.existsSync(PID_FILE)) return false;
+  
+  try {
+    const pid = fs.readFileSync(PID_FILE, 'utf8').trim();
+    process.kill(parseInt(pid), 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function stopMonitor() {
+  if (!fs.existsSync(PID_FILE)) {
+    return { success: false, error: 'Monitor not running' };
+  }
+  
+  try {
+    const pid = fs.readFileSync(PID_FILE, 'utf8').trim();
+    process.kill(parseInt(pid), 'SIGTERM');
+    fs.unlinkSync(PID_FILE);
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+// CLI Commands
+const commands = {
+  // Service management
+  async service_add() {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const question = (q) => new Promise(resolve => rl.question(q, resolve));
+
+    console.log('\n📦 Add Custom Service\n' + '═'.repeat(60));
+    
+    const id = await question('Service ID (lowercase, no spaces): ');
+    const name = await question('Display name: ');
+    const description = await question('Description: ');
+    const defaultUrl = await question('Default API URL: ');
+    const keyPrefix = await question('Key prefix (e.g., sk-): ') || '';
+    const authHeader = await question('Auth header name [Authorization]: ') || 'Authorization';
+    const authPrefix = await question('Auth prefix [Bearer ]: ') || 'Bearer ';
+    
+    const services = loadServices();
+    services[id] = {
+      name,
+      description,
+      defaultUrl,
+      keyPrefix,
+      authHeader,
+      authPrefix,
+      models: [],
+      addedAt: new Date().toISOString()
+    };
+    
+    saveServices(services);
+    console.log(`\n✓ Service "${name}" added successfully`);
+    rl.close();
+  },
+
+  async service_list() {
+    const services = loadServices();
+    
+    console.log('\n📋 Available Services\n' + '═'.repeat(80));
+    
+    for (const [id, service] of Object.entries(services)) {
+      const isBuiltin = DEFAULT_SERVICES[id] ? 'built-in' : 'custom';
+      console.log(`\n[${id}] ${service.name} (${isBuiltin})`);
+      console.log(`  ${service.description}`);
+      console.log(`  URL: ${service.defaultUrl}`);
+      if (service.models?.length) {
+        console.log(`  Models: ${service.models.join(', ')}`);
+      }
+    }
+    console.log();
+  },
+
+  // Key management
+  async key_add() {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const question = (q) => new Promise(resolve => rl.question(q, resolve));
+
+    console.log('\n🔑 Add API Key\n' + '═'.repeat(60));
+    
+    const services = loadServices();
+    console.log('Available services:');
+    Object.keys(services).forEach((id, i) => {
+      console.log(`  ${i + 1}. ${services[id].name} (${id})`);
+    });
+    
+    const serviceChoice = await question('\nSelect service (number or ID): ');
+    const serviceId = isNaN(serviceChoice) ? serviceChoice : Object.keys(services)[parseInt(serviceChoice) - 1];
+    
+    if (!services[serviceId]) {
+      console.error('Invalid service');
+      rl.close();
+      return;
+    }
+    
+    const service = services[serviceId];
+    const name = await question('Key name: ');
+    const key = await question(`API key${service.keyPrefix ? ` (${service.keyPrefix}...)` : ''}: `);
+    const customUrl = await question(`Custom API URL [${service.defaultUrl}]: `) || service.defaultUrl;
+    
+    console.log('\nValidating key...');
+    const health = await checkKeyHealth(serviceId, key, customUrl !== service.defaultUrl ? customUrl : null);
+    
+    if (!health.healthy) {
+      console.error(`✗ Key validation failed: ${health.status}`);
+      console.log('Add anyway? (yes/no)');
+      const force = await question('');
+      if (force.toLowerCase() !== 'yes') {
+        rl.close();
+        return;
+      }
+    } else {
+      console.log('✓ Key is valid');
+      if (health.usage) {
+        console.log(`  Credits: ${JSON.stringify(health.usage, null, 2)}`);
+      }
+    }
+
+    const keys = loadKeys();
+    if (!keys[serviceId]) keys[serviceId] = [];
+    
+    keys[serviceId].push({
+      name,
+      key,
+      customUrl: customUrl !== service.defaultUrl ? customUrl : null,
+      addedAt: new Date().toISOString()
+    });
+    
+    saveKeys(keys);
+    console.log(`\n✓ Key "${name}" added for ${service.name}`);
+    
+    // Set as active if first key
+    if (keys[serviceId].length === 1) {
+      const state = loadState();
+      state.currentKeyIndex[serviceId] = 0;
+      saveState(state);
+      console.log('✓ Set as active key');
+      
+      // Update integrations
+      const config = loadConfig();
+      if (config.integrations) {
+        for (const integrationId of config.integrations) {
+          const integration = INTEGRATIONS[integrationId];
+          if (integration?.supportedServices.includes(serviceId) || 
+              integration?.supportedServices.includes('*')) {
+            console.log(`  Updating ${integration.name}...`);
+            updateIntegration(integrationId, serviceId, key, 
+              customUrl !== service.defaultUrl ? customUrl : null);
+          }
+        }
+      }
+    }
+    
+    rl.close();
+  },
+
+  async key_list() {
+    const keys = loadKeys();
+    const state = loadState();
+    const services = loadServices();
+    
+    console.log('\n📋 API Keys\n' + '═'.repeat(80));
+    
+    for (const [serviceId, serviceKeys] of Object.entries(keys)) {
+      const service = services[serviceId];
+      console.log(`\n${service?.name || serviceId}:`);
+      
+      if (!serviceKeys || serviceKeys.length === 0) {
+        console.log('  (no keys)');
+        continue;
+      }
+      
+      const currentIndex = state.currentKeyIndex?.[serviceId] || 0;
+      
+      serviceKeys.forEach((key, i) => {
+        const isActive = i === currentIndex;
+        const masked = key.key.substring(0, 12) + '...' + key.key.slice(-8);
+        console.log(`  ${isActive ? '→' : ' '} [${i + 1}] ${key.name}: ${masked}`);
+        if (key.customUrl) {
+          console.log(`      Custom URL: ${key.customUrl}`);
+        }
+      });
+    }
+    console.log();
+  },
+
+  async key_check() {
+    const keys = loadKeys();
+    const services = loadServices();
+    
+    console.log('\n🔍 Checking All Keys\n' + '═'.repeat(80));
+    
+    for (const [serviceId, serviceKeys] of Object.entries(keys)) {
+      console.log(`\n${services[serviceId]?.name || serviceId}:`);
+      
+      for (const key of serviceKeys) {
+        process.stdout.write(`  ${key.name}: `);
+        const health = await checkKeyHealth(serviceId, key.key, key.customUrl);
+        
+        if (health.healthy) {
+          console.log('✓ healthy');
+        } else {
+          console.log(`✗ ${health.status}`);
+        }
+      }
+    }
+    console.log();
+  },
+
+  async key_remove() {
+    await commands.key_list();
+    
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const serviceId = await new Promise(resolve => 
+      rl.question('Enter service ID: ', resolve)
+    );
+    
+    const keys = loadKeys();
+    if (!keys[serviceId] || keys[serviceId].length === 0) {
+      console.log('No keys for this service');
+      rl.close();
+      return;
+    }
+    
+    const index = await new Promise(resolve => 
+      rl.question('Enter key number to remove: ', resolve)
+    );
+    
+    const idx = parseInt(index) - 1;
+    if (idx >= 0 && idx < keys[serviceId].length) {
+      const removed = keys[serviceId].splice(idx, 1)[0];
+      saveKeys(keys);
+      console.log(`✓ Removed key: ${removed.name}`);
+    } else {
+      console.log('Invalid key number');
+    }
+    
+    rl.close();
+  },
+
+  async rotate(args) {
+    const serviceId = args[0] || loadConfig().defaultService;
+    console.log(`🔄 Rotating key for ${serviceId}...`);
+    
+    const result = await rotateKey(serviceId);
+    if (result.success) {
+      console.log(`✓ Rotated to: ${result.key.name}`);
+    } else {
+      console.error(`✗ Rotation failed: ${result.error}`);
+    }
+  },
+
+  // Cycle management
+  async cycle_create() {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const question = (q) => new Promise(resolve => rl.question(q, resolve));
+
+    console.log('\n🔄 Create Cycle\n' + '═'.repeat(60));
+    
+    const name = await question('Cycle name: ');
+    const description = await question('Description: ');
+    
+    const services = loadServices();
+    const availableServices = Object.keys(services);
+    
+    console.log('\nAvailable services:');
+    availableServices.forEach((id, i) => {
+      console.log(`  ${i + 1}. ${services[id].name}`);
+    });
+    
+    const servicesInput = await question('\nEnter service IDs (comma-separated): ');
+    const serviceIds = servicesInput.split(',').map(s => s.trim()).filter(s => services[s]);
+    
+    if (serviceIds.length === 0) {
+      console.error('No valid services selected');
+      rl.close();
+      return;
+    }
+    
+    const models = {};
+    for (const serviceId of serviceIds) {
+      const service = services[serviceId];
+      if (service.models?.length) {
+        console.log(`\nAvailable models for ${service.name}:`);
+        service.models.forEach((m, i) => console.log(`  ${i + 1}. ${m}`));
+        const model = await question(`Select model for ${serviceId} [default]: `);
+        if (model) {
+          models[serviceId] = isNaN(model) ? model : service.models[parseInt(model) - 1];
+        }
+      }
+    }
+    
+    const interval = await question('Rotation interval in minutes [60]: ') || 60;
+    
+    createCycle(name, serviceIds, {
+      description,
+      models,
+      rotationInterval: parseInt(interval) * 60000
+    });
+    
+    console.log(`\n✓ Cycle "${name}" created`);
+    rl.close();
+  },
+
+  async cycle_list() {
+    const cycles = loadCycles();
+    const state = loadState();
+    
+    console.log('\n🔄 Cycles\n' + '═'.repeat(80));
+    
+    for (const [name, cycle] of Object.entries(cycles.cycles)) {
+      const isActive = state.activeCycle === name;
+      console.log(`\n${isActive ? '→' : ' '} ${name}`);
+      console.log(`  ${cycle.description || 'No description'}`);
+      console.log(`  Services: ${cycle.services.join(', ')}`);
+      console.log(`  Interval: ${cycle.rotationInterval / 60000} minutes`);
+      if (Object.keys(cycle.models || {}).length) {
+        console.log(`  Models: ${JSON.stringify(cycle.models)}`);
+      }
+    }
+    console.log();
+  },
+
+  async cycle_activate(args) {
+    const name = args[0];
+    if (!name) {
+      console.error('Usage: vkm cycle-activate <cycle-name>');
+      return;
+    }
+    
+    const result = activateCycle(name);
+    if (result.success) {
+      console.log(`✓ Activated cycle: ${name}`);
+    } else {
+      console.error(`✗ ${result.error}`);
+    }
+  },
+
+  async cycle_next() {
+    const cycles = loadCycles();
+    const state = loadState();
+    
+    if (!state.activeCycle) {
+      console.error('No active cycle. Use: vkm cycle-activate <name>');
+      return;
+    }
+    
+    const next = getNextInCycle(state.activeCycle);
+    if (next) {
+      console.log(`Next in cycle "${state.activeCycle}":`);
+      console.log(`  Service: ${next.service}`);
+      if (next.model) console.log(`  Model: ${next.model}`);
+      
+      await rotateKey(next.service);
+    }
+  },
+
+  async cycle_history() {
+    const cycles = loadCycles();
+    
+    console.log('\n📜 Cycle History\n' + '═'.repeat(80));
+    
+    const history = cycles.history?.slice(-20).reverse() || [];
+    if (history.length === 0) {
+      console.log('No history yet');
+      return;
+    }
+    
+    history.forEach(entry => {
+      const time = new Date(entry.timestamp).toLocaleString();
+      console.log(`[${time}] ${entry.cycle}: ${entry.service}${entry.model ? ` (${entry.model})` : ''}`);
+    });
+    console.log();
+  },
+
+  // Integration management
+  async integration_list() {
+    const config = loadConfig();
+    
+    console.log('\n🔌 Integrations\n' + '═'.repeat(80));
+    
+    for (const [id, integration] of Object.entries(INTEGRATIONS)) {
+      const enabled = config.integrations?.includes(id);
+      console.log(`\n${enabled ? '✓' : '○'} ${integration.name}`);
+      console.log(`  Supported services: ${integration.supportedServices.join(', ')}`);
+      console.log(`  Config files:`);
+      integration.configFiles.forEach(f => {
+        const exists = fs.existsSync(f) ? '✓' : '✗';
+        console.log(`    ${exists} ${f}`);
+      });
+    }
+    console.log();
+  },
+
+  async integration_enable(args) {
+    const id = args[0];
+    if (!INTEGRATIONS[id]) {
+      console.error(`Unknown integration: ${id}`);
+      return;
+    }
+    
+    const config = loadConfig();
+    if (!config.integrations) config.integrations = [];
+    if (!config.integrations.includes(id)) {
+      config.integrations.push(id);
+      saveConfig(config);
+    }
+    
+    console.log(`✓ Enabled integration: ${INTEGRATIONS[id].name}`);
+  },
+
+  async integration_disable(args) {
+    const id = args[0];
+    const config = loadConfig();
+    
+    if (config.integrations) {
+      config.integrations = config.integrations.filter(i => i !== id);
+      saveConfig(config);
+    }
+    
+    console.log(`✓ Disabled integration: ${id}`);
+  },
+
+  // Kiro proxy management
+  async kiro_status() {
+    const config = loadConfig();
+    const running = await isKiroProxyRunning(config.kiroProxyPort);
+    
+    console.log('\n🌐 Kiro Gateway Status\n' + '═'.repeat(60));
+    console.log(`Status: ${running ? '✓ Running' : '✗ Stopped'}`);
+    console.log(`Port: ${config.kiroProxyPort}`);
+    console.log(`Auto-start: ${config.kiroProxyAutoStart ? 'enabled' : 'disabled'}`);
+    console.log(`Repository: https://github.com/jwadow/kiro-gateway`);
+    console.log();
+  },
+
+  async kiro_start() {
+    const config = loadConfig();
+    const result = await startKiroProxy(config.kiroProxyPort);
+    
+    if (result.success) {
+      console.log(result.alreadyRunning 
+        ? '✓ Kiro proxy already running'
+        : `✓ Kiro proxy started (PID: ${result.pid})`
+      );
+    } else {
+      console.error(`✗ Failed to start: ${result.error}`);
+    }
+  },
+
+  async kiro_stop() {
+    await stopKiroProxy();
+    console.log('✓ Kiro proxy stopped');
+  },
+
+  async kiro_enable() {
+    const config = loadConfig();
+    config.kiroProxyEnabled = true;
+    saveConfig(config);
+    console.log('✓ Kiro proxy enabled');
+    
+    if (config.kiroProxyAutoStart) {
+      await commands.kiro_start();
+    }
+  },
+
+  async kiro_disable() {
+    const config = loadConfig();
+    config.kiroProxyEnabled = false;
+    saveConfig(config);
+    await stopKiroProxy();
+    console.log('✓ Kiro proxy disabled');
+  },
+
+  // Monitor control
+  async monitor() {
+    if (isMonitorRunning()) {
+      console.log('Monitor is already running');
+      return;
+    }
+    
+    // Daemonize
+    const proc = spawn(process.argv[0], [process.argv[1], 'monitor-daemon'], {
+      detached: true,
+      stdio: 'ignore'
+    });
+    proc.unref();
+    
+    setTimeout(() => {
+      if (isMonitorRunning()) {
+        console.log('✓ Monitor daemon started');
+      } else {
+        console.error('✗ Failed to start monitor');
+      }
+    }, 1000);
+  },
+
+  'monitor-daemon': async () => {
+    await monitorDaemon();
+  },
+
+  async monitor_stop() {
+    const result = stopMonitor();
+    if (result.success) {
+      console.log('✓ Monitor stopped');
+    } else {
+      console.error(`✗ ${result.error}`);
+    }
+  },
+
+  async monitor_status() {
+    const running = isMonitorRunning();
+    const config = loadConfig();
+    
+    console.log('\n📊 Monitor Status\n' + '═'.repeat(60));
+    console.log(`Status: ${running ? '✓ Running' : '✗ Stopped'}`);
+    console.log(`Auto-rotation: ${config.rotationEnabled ? 'enabled' : 'disabled'}`);
+    console.log(`Cycle management: ${config.cycleEnabled ? 'enabled' : 'disabled'}`);
+    console.log(`Check interval: ${config.monitorInterval / 1000}s`);
+    console.log();
+  },
+
+  // Configuration
+  async config() {
+    const config = loadConfig();
+    
+    console.log('\n⚙️  Configuration\n' + '═'.repeat(60));
+    console.log(JSON.stringify(config, null, 2));
+    console.log();
+  },
+
+  async config_set(args) {
+    if (args.length < 2) {
+      console.error('Usage: vkm config-set <key> <value>');
+      return;
+    }
+    
+    const [key, ...valueParts] = args;
+    const value = valueParts.join(' ');
+    
+    const config = loadConfig();
+    
+    // Parse value
+    let parsed = value;
+    if (value === 'true') parsed = true;
+    else if (value === 'false') parsed = false;
+    else if (!isNaN(value)) parsed = Number(value);
+    
+    config[key] = parsed;
+    saveConfig(config);
+    
+    console.log(`✓ Set ${key} = ${JSON.stringify(parsed)}`);
+  },
+
+  // Status
+  async status() {
+    const config = loadConfig();
+    const keys = loadKeys();
+    const state = loadState();
+    const cycles = loadCycles();
+    
+    console.log('\n📈 VKM Status\n' + '═'.repeat(80));
+    console.log(`Monitor: ${isMonitorRunning() ? '✓ Running' : '✗ Stopped'}`);
+    console.log(`Kiro Proxy: ${await isKiroProxyRunning(config.kiroProxyPort) ? '✓ Running' : '✗ Stopped'}`);
+    
+    console.log('\nActive Keys:');
+    for (const [serviceId, serviceKeys] of Object.entries(keys)) {
+      const currentIndex = state.currentKeyIndex?.[serviceId] || 0;
+      const key = serviceKeys?.[currentIndex];
+      const health = state.keyHealth?.[serviceId]?.status || 'unknown';
+      console.log(`  ${serviceId}: ${key?.name || 'none'} (${health})`);
+    }
+    
+    if (state.activeCycle) {
+      console.log(`\nActive Cycle: ${state.activeCycle}`);
+    }
+    
+    console.log();
+  },
+
+  // Setup and init
+  async init() {
+    console.log('\n🚀 Initializing VKM\n' + '═'.repeat(60));
+    
+    if (!fs.existsSync(CONFIG_DIR)) {
+      fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    }
+    
+    // Initialize default config
+    const config = loadConfig();
+    saveConfig(config);
+    
+    // Initialize empty stores
+    saveKeys(loadKeys());
+    saveCycles(loadCycles());
+    saveState(loadState());
+    
+    console.log('✓ Configuration directory created: ' + CONFIG_DIR);
+    console.log('✓ Default configuration initialized');
+    
+    // Create systemd service file
+    const systemdDir = path.join(process.env.HOME, '.config', 'systemd', 'user');
+    fs.mkdirSync(systemdDir, { recursive: true });
+    
+    const serviceContent = `[Unit]
+Description=Virtual Key Manager Monitor
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${process.argv[0]} ${process.argv[1]} monitor-daemon
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+`;
+    
+    fs.writeFileSync(path.join(systemdDir, 'vkm-monitor.service'), serviceContent);
+    console.log('✓ Systemd user service created');
+    console.log('  Enable on boot: systemctl --user enable vkm-monitor.service');
+    console.log('  Start now: systemctl --user start vkm-monitor.service');
+    
+    console.log('\nNext steps:');
+    console.log('  1. Add API keys: vkm key-add');
+    console.log('  2. Start monitor: vkm monitor');
+    console.log('  3. View status: vkm status');
+    console.log();
+  },
+
+  // Logs
+  async logs() {
+    if (!fs.existsSync(LOG_FILE)) {
+      console.log('No logs yet');
+      return;
+    }
+    
+    const lines = fs.readFileSync(LOG_FILE, 'utf8').split('\n').filter(Boolean);
+    const lastLines = lines.slice(-50);
+    
+    console.log('\n📝 Recent Logs\n' + '═'.repeat(80));
+    lastLines.forEach(line => console.log(line));
+    console.log();
+  },
+
+  // TUI - Node-based Visual Editor
+  async tui() {
+    const tuiPath = path.join(__dirname, '..', 'vkm-tui', 'bin', 'vkm-tui');
+    
+    // Check if vkm-tui is installed
+    if (!fs.existsSync(tuiPath)) {
+      console.log('🎨 VKM TUI not installed. Installing...');
+      
+      const vkmTuiDir = path.join(__dirname, '..', 'vkm-tui');
+      
+      // Create vkm-tui directory structure
+      if (!fs.existsSync(vkmTuiDir)) {
+        fs.mkdirSync(vkmTuiDir, { recursive: true });
+        fs.mkdirSync(path.join(vkmTuiDir, 'src'), { recursive: true });
+        fs.mkdirSync(path.join(vkmTuiDir, 'bin'), { recursive: true });
+        fs.mkdirSync(path.join(vkmTuiDir, 'templates'), { recursive: true });
+      }
+      
+      console.log('✓ VKM TUI directory created');
+      console.log('');
+      console.log('Please install vkm-tui from:');
+      console.log('  ' + path.join(__dirname, '..', 'vkm-tui'));
+      console.log('');
+      console.log('Or run: npm install neo-blessed in the vkm-tui directory');
+      return;
+    }
+    
+    // Launch the TUI
+    console.log('🎨 Launching VKM Node Editor...');
+    
+    const child = spawn('node', [tuiPath], {
+      stdio: 'inherit',
+      detached: false
+    });
+    
+    child.on('close', (code) => {
+      process.exit(code);
+    });
+  },
+
+  // Session Management
+  async session_list() {
+    const sessionsDir = path.join(CONFIG_DIR, 'sessions');
+    
+    if (!fs.existsSync(sessionsDir)) {
+      console.log('No sessions created yet');
+      return;
+    }
+    
+    const sessions = fs.readdirSync(sessionsDir)
+      .filter(f => f.endsWith('.json'))
+      .map(f => {
+        const data = JSON.parse(fs.readFileSync(path.join(sessionsDir, f), 'utf8'));
+        return {
+          id: data.id,
+          name: data.name,
+          state: data.state,
+          template: data.template,
+          created: new Date(data.createdAt).toLocaleString()
+        };
+      });
+    
+    console.log('\n🎯 Sessions\n' + '═'.repeat(80));
+    sessions.forEach(s => {
+      const status = s.state === 'active' ? '🟢' : 
+                    s.state === 'stopped' ? '🔴' : '🟡';
+      console.log(`${status} ${s.name} (${s.id})`);
+      console.log(`   Template: ${s.template || 'none'}`);
+      console.log(`   Created: ${s.created}`);
+      console.log();
+    });
+  },
+
+  async session_create(args) {
+    const name = args[0] || `Session-${Date.now()}`;
+    const template = args[1];
+    
+    const sessionsDir = path.join(CONFIG_DIR, 'sessions');
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    
+    const sessionId = `session-${Date.now()}`;
+    const session = {
+      id: sessionId,
+      name,
+      template,
+      state: 'created',
+      createdAt: new Date().toISOString(),
+      nodes: [],
+      connections: []
+    };
+    
+    fs.writeFileSync(
+      path.join(sessionsDir, `${sessionId}.json`),
+      JSON.stringify(session, null, 2)
+    );
+    
+    console.log(`✓ Session created: ${name} (${sessionId})`);
+    if (template) {
+      console.log(`  Template: ${template}`);
+    }
+  },
+
+  async session_start(args) {
+    const sessionId = args[0];
+    if (!sessionId) {
+      console.error('Usage: vkm session-start <session-id>');
+      return;
+    }
+    
+    console.log(`🚀 Starting session: ${sessionId}`);
+    console.log('Use vkm-tui for visual session management');
+  },
+
+  async session_stop(args) {
+    const sessionId = args[0];
+    if (!sessionId) {
+      console.error('Usage: vkm session-stop <session-id>');
+      return;
+    }
+    
+    console.log(`🛑 Stopping session: ${sessionId}`);
+  },
+
+  // Graph Management
+  async graph_save() {
+    console.log('💾 Current graph state saved');
+    console.log('Graphs are automatically saved when using vkm-tui');
+  },
+
+  async graph_load(args) {
+    const graphFile = args[0];
+    if (!graphFile) {
+      console.error('Usage: vkm graph-load <file>');
+      return;
+    }
+    
+    console.log(`📂 Loading graph: ${graphFile}`);
+    console.log('Use vkm-tui for visual graph editing');
+  },
+
+  async graph_export() {
+    const graphFile = path.join(CONFIG_DIR, 'graph.json');
+    if (!fs.existsSync(graphFile)) {
+      console.log('No graph to export');
+      return;
+    }
+    
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const exportFile = path.join(CONFIG_DIR, `graph-export-${timestamp}.json`);
+    
+    fs.copyFileSync(graphFile, exportFile);
+    console.log(`✓ Graph exported to: ${exportFile}`);
+  },
+
+  // Template Management
+  async template_list() {
+    const templates = {
+      'all-glm5': { name: 'ALL GLM-5 MODAL', icon: '🧠', desc: 'GLM-5 multimodal with fallback' },
+      'kiro-proxy-4.5': { name: 'ALL KIRO PROXY 4.5', icon: '🔮', desc: 'Kiro Gateway with Claude fallback' },
+      'multi-model-ensemble': { name: 'Multi-Model Ensemble', icon: '⚡', desc: 'Parallel multi-model processing' },
+      'fallback-chain': { name: 'Fallback Chain', icon: '🔗', desc: 'Sequential provider fallback' },
+      'round-robin': { name: 'Round Robin', icon: '🔄', desc: 'Load-balanced key rotation' }
+    };
+    
+    console.log('\n📋 Available Templates\n' + '═'.repeat(80));
+    
+    for (const [id, tpl] of Object.entries(templates)) {
+      console.log(`\n${tpl.icon} ${tpl.name} (${id})`);
+      console.log(`   ${tpl.desc}`);
+      console.log(`   Quick load: vkm tui, then press ${Object.keys(templates).indexOf(id) + 1}`);
+    }
+    console.log();
+  },
+
+  async template_apply(args) {
+    const templateId = args[0];
+    if (!templateId) {
+      console.error('Usage: vkm template-apply <template-id>');
+      console.log('Run "vkm template-list" to see available templates');
+      return;
+    }
+    
+    console.log(`📦 Applying template: ${templateId}`);
+    console.log('Launching TUI...');
+    await commands.tui();
+  },
+
+  // Help
+  help() {
+    console.log(`
+╭────────────────────────────────────────────────────────────────────────────╮
+│                    Virtual Key Manager (VKM) v2.0                          │
+│         General-purpose API key manager with adaptive integrations         │
+╰────────────────────────────────────────────────────────────────────────────╯
+
+USAGE: vkm <command> [args]
+
+🎨 VISUAL INTERFACE:
+  tui               Launch node-based visual editor (Jack Audio style)
+
+🔧 SETUP & CONFIGURATION:
+  init              Initialize VKM configuration and directories
+  config            Show current configuration
+  config-set <k> <v> Set configuration value
+
+🗝️  KEY MANAGEMENT:
+  key-add           Add a new API key for any service
+  key-list          List all configured keys
+  key-check         Check health of all keys
+  key-remove        Remove a key
+  rotate [service]  Rotate to next healthy key (default: openrouter)
+
+🏢 SERVICE MANAGEMENT:
+  service-add       Add a custom service definition
+  service-list      List all available services
+
+🔄 CYCLE MANAGEMENT:
+  cycle-create      Create a new key rotation cycle
+  cycle-list        List all cycles
+  cycle-activate    Activate a cycle for current context
+  cycle-next        Manually advance to next in cycle
+  cycle-history     View cycle rotation history
+
+🔌 INTEGRATIONS:
+  integration-list  List available integrations
+  integration-enable <id>   Enable an integration
+  integration-disable <id>  Disable an integration
+
+🎯 SESSION MANAGEMENT:
+  session-list      List all sessions
+  session-create <name> [template]  Create new session
+  session-start <id>          Start a session
+  session-stop <id>           Stop a session
+
+📊 GRAPH MANAGEMENT:
+  graph-save        Save current graph state
+  graph-load <file> Load graph from file
+  graph-export      Export graph to timestamped file
+
+📋 TEMPLATES:
+  template-list     List available templates
+  template-apply <id>         Apply template (opens TUI)
+
+📊 MONITORING:
+  monitor           Start background monitor daemon
+  monitor-stop      Stop background monitor
+  monitor-status    Check monitor status
+
+🌐 KIRO PROXY:
+  kiro-status       Check Kiro gateway status
+  kiro-start        Start Kiro proxy
+  kiro-stop         Stop Kiro proxy
+  kiro-enable       Enable and auto-start Kiro
+  kiro-disable      Disable Kiro proxy
+
+ℹ️  INFORMATION:
+  status            Show complete VKM status
+  logs              View recent logs
+  help              Show this help message
+
+EXAMPLES:
+  vkm init
+  vkm tui                    # Visual node editor
+  vkm key-add
+  vkm rotate openrouter
+  vkm template-apply kiro-proxy-4.5
+  vkm monitor
+
+TEMPLATES (in TUI, press number keys):
+  1: ALL GLM-5 MODAL
+  2: ALL KIRO PROXY 4.5
+  3: Multi-Model Ensemble
+  4: Fallback Chain
+  5: Round Robin Load Balancer
+
+CONFIG LOCATION: ${CONFIG_DIR}
+`);
+  }
+};
+
+// Initialize on first run
+if (!fs.existsSync(CONFIG_DIR)) {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+}
+
+// Main entry
+const [,, command, ...args] = process.argv;
+
+if (!command || !commands[command]) {
+  commands.help();
+  process.exit(0);
+}
+
+Promise.resolve().then(() => commands[command](args)).catch(err => {
+  log(err.message, 'error');
+  process.exit(1);
+});

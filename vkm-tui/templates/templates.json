@@ -1,0 +1,380 @@
+{
+  "version": "2.0.0",
+  "templates": {
+    "all-glm5": {
+      "name": "ALL GLM-5 MODAL",
+      "description": "Full GLM-5 multimodal setup across all providers with intelligent fallback",
+      "icon": "🧠",
+      "category": "multimodal",
+      "author": "VKM Team",
+      "tags": ["glm", "multimodal", "fallback", "zhipu", "openrouter"],
+      "nodes": [
+        {
+          "id": "glm5-primary",
+          "type": "service",
+          "service": "zhipu",
+          "model": "glm-5",
+          "x": 10,
+          "y": 10,
+          "label": "GLM-5 Primary",
+          "description": "Zhipu GLM-5 main endpoint"
+        },
+        {
+          "id": "glm5-openrouter",
+          "type": "service",
+          "service": "openrouter",
+          "model": "zhipu/glm-5",
+          "x": 10,
+          "y": 25,
+          "label": "GLM-5 OpenRouter",
+          "description": "OpenRouter GLM-5 mirror"
+        },
+        {
+          "id": "key-zhipu",
+          "type": "key",
+          "service": "zhipu",
+          "x": 40,
+          "y": 10,
+          "label": "Zhipu Key"
+        },
+        {
+          "id": "key-openrouter",
+          "type": "key",
+          "service": "openrouter",
+          "x": 40,
+          "y": 25,
+          "label": "OpenRouter Key"
+        },
+        {
+          "id": "multimodal-router",
+          "type": "router",
+          "mode": "priority-failover",
+          "x": 70,
+          "y": 17,
+          "label": "Multimodal Router",
+          "description": "Routes to best available GLM-5 endpoint"
+        },
+        {
+          "id": "openclaw-integration",
+          "type": "integration",
+          "integration": "openclaw",
+          "x": 100,
+          "y": 10,
+          "label": "OpenClaw"
+        },
+        {
+          "id": "claude-code-integration",
+          "type": "integration",
+          "integration": "claude-code",
+          "x": 100,
+          "y": 25,
+          "label": "Claude Code"
+        },
+        {
+          "id": "glm5-session",
+          "type": "session",
+          "x": 130,
+          "y": 17,
+          "label": "GLM-5 Session",
+          "persistent": true
+        }
+      ],
+      "connections": [
+        { "from": "glm5-primary", "to": "key-zhipu", "label": "auth", "priority": 1 },
+        { "from": "glm5-openrouter", "to": "key-openrouter", "label": "auth", "priority": 2 },
+        { "from": "key-zhipu", "to": "multimodal-router", "label": "primary", "priority": 1 },
+        { "from": "key-openrouter", "to": "multimodal-router", "label": "fallback", "priority": 2 },
+        { "from": "multimodal-router", "to": "openclaw-integration", "label": "route" },
+        { "from": "multimodal-router", "to": "claude-code-integration", "label": "route" },
+        { "from": "openclaw-integration", "to": "glm5-session", "label": "out" },
+        { "from": "claude-code-integration", "to": "glm5-session", "label": "out" }
+      ],
+      "config": {
+        "autoFailover": true,
+        "healthCheckInterval": 30,
+        "failoverThreshold": 2,
+        "loadBalance": false,
+        "timeout": 30000
+      }
+    },
+    "kiro-proxy-4.5": {
+      "name": "ALL KIRO PROXY 4.5",
+      "description": "Kiro Gateway with Claude Sonnet fallback chain and intelligent routing",
+      "icon": "🔮",
+      "category": "proxy",
+      "author": "VKM Team",
+      "tags": ["kiro", "claude", "sonnet", "proxy", "fallback", "anthropic"],
+      "requires": ["kiro-gateway"],
+      "nodes": [
+        {
+          "id": "kiro-gateway",
+          "type": "service",
+          "service": "kiro",
+          "x": 10,
+          "y": 5,
+          "label": "Kiro Gateway",
+          "description": "Local Kiro proxy (port 8787)"
+        },
+        {
+          "id": "anthropic-direct",
+          "type": "service",
+          "service": "anthropic",
+          "model": "claude-3-5-sonnet-20241022",
+          "x": 10,
+          "y": 20,
+          "label": "Anthropic Direct",
+          "description": "Direct Anthropic API"
+        },
+        {
+          "id": "openrouter-claude",
+          "type": "service",
+          "service": "openrouter",
+          "model": "anthropic/claude-3.5-sonnet",
+          "x": 10,
+          "y": 35,
+          "label": "OpenRouter Claude",
+          "description": "OpenRouter Claude mirror"
+        },
+        {
+          "id": "key-kiro",
+          "type": "key",
+          "service": "kiro",
+          "x": 40,
+          "y": 5,
+          "label": "Kiro Key"
+        },
+        {
+          "id": "key-anthropic",
+          "type": "key",
+          "service": "anthropic",
+          "x": 40,
+          "y": 20,
+          "label": "Anthropic Key"
+        },
+        {
+          "id": "key-openrouter",
+          "type": "key",
+          "service": "openrouter",
+          "x": 40,
+          "y": 35,
+          "label": "OpenRouter Key"
+        },
+        {
+          "id": "kiro-failover-router",
+          "type": "router",
+          "mode": "failover",
+          "x": 70,
+          "y": 20,
+          "label": "Kiro Failover Router",
+          "description": "Kiro → Anthropic → OpenRouter"
+        },
+        {
+          "id": "proxy-cache",
+          "type": "router",
+          "mode": "cache",
+          "x": 100,
+          "y": 10,
+          "label": "Response Cache"
+        },
+        {
+          "id": "openclaw-integration",
+          "type": "integration",
+          "integration": "openclaw",
+          "x": 130,
+          "y": 5,
+          "label": "OpenClaw"
+        },
+        {
+          "id": "claude-code-integration",
+          "type": "integration",
+          "integration": "claude-code",
+          "x": 130,
+          "y": 20,
+          "label": "Claude Code"
+        },
+        {
+          "id": "aider-integration",
+          "type": "integration",
+          "integration": "aider",
+          "x": 130,
+          "y": 35,
+          "label": "Aider"
+        },
+        {
+          "id": "kiro-primary-session",
+          "type": "session",
+          "x": 160,
+          "y": 12,
+          "label": "Kiro Primary Session"
+        },
+        {
+          "id": "kiro-fallback-session",
+          "type": "session",
+          "x": 160,
+          "y": 27,
+          "label": "Kiro Fallback Session"
+        }
+      ],
+      "connections": [
+        { "from": "kiro-gateway", "to": "key-kiro", "label": "auth", "priority": 1 },
+        { "from": "anthropic-direct", "to": "key-anthropic", "label": "auth", "priority": 2 },
+        { "from": "openrouter-claude", "to": "key-openrouter", "label": "auth", "priority": 3 },
+        { "from": "key-kiro", "to": "kiro-failover-router", "label": "p1", "priority": 1 },
+        { "from": "key-anthropic", "to": "kiro-failover-router", "label": "p2", "priority": 2 },
+        { "from": "key-openrouter", "to": "kiro-failover-router", "label": "p3", "priority": 3 },
+        { "from": "kiro-failover-router", "to": "proxy-cache", "label": "response" },
+        { "from": "proxy-cache", "to": "openclaw-integration", "label": "cached" },
+        { "from": "proxy-cache", "to": "claude-code-integration", "label": "cached" },
+        { "from": "proxy-cache", "to": "aider-integration", "label": "cached" },
+        { "from": "openclaw-integration", "to": "kiro-primary-session", "label": "out" },
+        { "from": "claude-code-integration", "to": "kiro-fallback-session", "label": "out" },
+        { "from": "aider-integration", "to": "kiro-fallback-session", "label": "out" }
+      ],
+      "config": {
+        "kiroPort": 8787,
+        "autoStartKiro": true,
+        "failoverDelay": 5000,
+        "healthCheckInterval": 60,
+        "cacheEnabled": true,
+        "cacheTTL": 3600,
+        "retryAttempts": 3
+      }
+    },
+    "enterprise-mesh": {
+      "name": "Enterprise API Mesh",
+      "description": "Multi-region, multi-provider mesh with circuit breakers and intelligent routing",
+      "icon": "🏢",
+      "category": "enterprise",
+      "author": "VKM Team",
+      "tags": ["enterprise", "mesh", "multi-region", "circuit-breaker", "load-balancer"],
+      "nodes": [
+        {
+          "id": "region-us-east",
+          "type": "router",
+          "mode": "region",
+          "x": 20,
+          "y": 10,
+          "label": "US-East Region"
+        },
+        {
+          "id": "region-eu-west",
+          "type": "router",
+          "mode": "region",
+          "x": 20,
+          "y": 30,
+          "label": "EU-West Region"
+        },
+        {
+          "id": "region-apac",
+          "type": "router",
+          "mode": "region",
+          "x": 20,
+          "y": 50,
+          "label": "APAC Region"
+        },
+        {
+          "id": "anthropic-us",
+          "type": "service",
+          "service": "anthropic",
+          "region": "us-east-1",
+          "x": 50,
+          "y": 5,
+          "label": "Anthropic US"
+        },
+        {
+          "id": "openai-us",
+          "type": "service",
+          "service": "openai",
+          "region": "us-east-1",
+          "x": 50,
+          "y": 15,
+          "label": "OpenAI US"
+        },
+        {
+          "id": "anthropic-eu",
+          "type": "service",
+          "service": "anthropic",
+          "region": "eu-west-1",
+          "x": 50,
+          "y": 25,
+          "label": "Anthropic EU"
+        },
+        {
+          "id": "groq-eu",
+          "type": "service",
+          "service": "groq",
+          "region": "eu-west-1",
+          "x": 50,
+          "y": 35,
+          "label": "Groq EU"
+        },
+        {
+          "id": "openrouter-apac",
+          "type": "service",
+          "service": "openrouter",
+          "region": "ap-southeast-1",
+          "x": 50,
+          "y": 45,
+          "label": "OpenRouter APAC"
+        },
+        {
+          "id": "groq-apac",
+          "type": "service",
+          "service": "groq",
+          "region": "ap-northeast-1",
+          "x": 50,
+          "y": 55,
+          "label": "Groq APAC"
+        },
+        {
+          "id": "circuit-breaker",
+          "type": "router",
+          "mode": "circuit-breaker",
+          "x": 80,
+          "y": 30,
+          "label": "Circuit Breaker"
+        },
+        {
+          "id": "global-load-balancer",
+          "type": "router",
+          "mode": "load-balance",
+          "x": 110,
+          "y": 30,
+          "label": "Global LB"
+        },
+        {
+          "id": "enterprise-integration",
+          "type": "integration",
+          "integration": "custom",
+          "x": 140,
+          "y": 30,
+          "label": "Enterprise Apps"
+        }
+      ],
+      "connections": [
+        { "from": "region-us-east", "to": "anthropic-us", "label": "route" },
+        { "from": "region-us-east", "to": "openai-us", "label": "route" },
+        { "from": "region-eu-west", "to": "anthropic-eu", "label": "route" },
+        { "from": "region-eu-west", "to": "groq-eu", "label": "route" },
+        { "from": "region-apac", "to": "openrouter-apac", "label": "route" },
+        { "from": "region-apac", "to": "groq-apac", "label": "route" },
+        { "from": "anthropic-us", "to": "circuit-breaker", "label": "health" },
+        { "from": "openai-us", "to": "circuit-breaker", "label": "health" },
+        { "from": "anthropic-eu", "to": "circuit-breaker", "label": "health" },
+        { "from": "groq-eu", "to": "circuit-breaker", "label": "health" },
+        { "from": "openrouter-apac", "to": "circuit-breaker", "label": "health" },
+        { "from": "groq-apac", "to": "circuit-breaker", "label": "health" },
+        { "from": "circuit-breaker", "to": "global-load-balancer", "label": "healthy" },
+        { "from": "global-load-balancer", "to": "enterprise-integration", "label": "api" }
+      ],
+      "config": {
+        "circuitBreakerThreshold": 5,
+        "circuitBreakerTimeout": 60000,
+        "geoRouting": true,
+        "latencyBasedRouting": true,
+        "healthCheckInterval": 30,
+        "autoScaling": true
+      }
+    }
+  }
+}

@@ -1,0 +1,166 @@
+#!/usr/bin/env node
+
+/**
+ * VKM TUI Launcher
+ * Launches the node-based visual editor
+ */
+
+const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+const VKM_TUI_DIR = path.join(__dirname, '..');
+const SRC_DIR = path.join(VKM_TUI_DIR, 'src');
+
+// Check if blessed is installed
+function checkDependencies() {
+  try {
+    require.resolve('neo-blessed');
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// Install dependencies if needed
+function installDependencies() {
+  console.log('Installing required dependencies...');
+  console.log('  - neo-blessed');
+  
+  return new Promise((resolve, reject) => {
+    const npm = spawn('npm', ['install', 'neo-blessed'], {
+      cwd: VKM_TUI_DIR,
+      stdio: 'inherit'
+    });
+    
+    npm.on('close', (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`npm install failed with code ${code}`));
+      }
+    });
+  });
+}
+
+// Launch the TUI
+async function launch() {
+  if (!checkDependencies()) {
+    console.log('VKM TUI requires additional dependencies.');
+    console.log('');
+    
+    const readline = require('readline');
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
+    
+    const answer = await new Promise(resolve => {
+      rl.question('Install dependencies now? (y/n) ', resolve);
+    });
+    
+    rl.close();
+    
+    if (answer.toLowerCase() === 'y') {
+      try {
+        await installDependencies();
+        console.log('Dependencies installed!');
+      } catch (error) {
+        console.error('Failed to install dependencies:', error.message);
+        process.exit(1);
+      }
+    } else {
+      console.log('Please install manually:');
+      console.log('  cd ' + VKM_TUI_DIR);
+      console.log('  npm install neo-blessed');
+      process.exit(1);
+    }
+  }
+
+  // Launch the TUI
+  const tuiPath = path.join(SRC_DIR, 'vkm-tui.js');
+  
+  if (!fs.existsSync(tuiPath)) {
+    console.error('TUI not found:', tuiPath);
+    process.exit(1);
+  }
+
+  console.log('Starting VKM Node Editor...');
+  console.log('');
+  console.log('Tips:');
+  console.log('  - Press "h" for help');
+  console.log('  - Press "t" for templates');
+  console.log('  - Press "q" to quit');
+  console.log('');
+  
+  // Small delay to show message
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  
+  // Clear screen and start TUI
+  const tui = spawn('node', [tuiPath], {
+    stdio: 'inherit',
+    env: {
+      ...process.env,
+      VKM_TUI: '1'
+    }
+  });
+  
+  tui.on('close', (code) => {
+    process.exit(code);
+  });
+}
+
+// Parse command line arguments
+const args = process.argv.slice(2);
+
+if (args.includes('--help') || args.includes('-h')) {
+  console.log(`
+VKM TUI - Node-based Visual Editor
+
+Usage: vkm-tui [options]
+
+Options:
+  -h, --help     Show this help message
+  -v, --version  Show version
+  --install      Install dependencies only
+
+Keyboard Shortcuts (in TUI):
+  n          Create new node
+  t          Show templates
+  c          Start connection
+  d          Delete selected
+  s          Save graph
+  l          Load graph
+  g          Toggle grid
+  h          Help
+  q          Quit
+
+Templates:
+  1          ALL GLM-5 MODAL
+  2          ALL KIRO PROXY 4.5
+  3          Multi-Model Ensemble
+  4          Fallback Chain
+  5          Round Robin Load Balancer
+`);
+  process.exit(0);
+}
+
+if (args.includes('--version') || args.includes('-v')) {
+  console.log('vkm-tui 2.0.0');
+  process.exit(0);
+}
+
+if (args.includes('--install')) {
+  installDependencies().then(() => {
+    console.log('Dependencies installed successfully!');
+    process.exit(0);
+  }).catch((err) => {
+    console.error('Installation failed:', err.message);
+    process.exit(1);
+  });
+} else {
+  launch().catch(err => {
+    console.error('Error launching TUI:', err.message);
+    process.exit(1);
+  });
+}

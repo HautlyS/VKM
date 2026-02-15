@@ -1,0 +1,29 @@
+[Unit]
+Description=Virtual Key Manager - API Key Monitor and Rotator
+Documentation=https://github.com/yourusername/vkm
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment="VKM_HOME=%h/.vkm"
+Environment="NODE_ENV=production"
+ExecStart=%h/.vkm/bin/vkm monitor-daemon
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10
+StartLimitInterval=60s
+StartLimitBurst=3
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vkm
+
+# Security
+NoNewPrivileges=false
+ProtectSystem=false
+ProtectHome=false
+
+[Install]
+WantedBy=default.target

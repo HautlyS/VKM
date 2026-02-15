@@ -1,0 +1,121 @@
+#!/bin/bash
+#
+# Kiro Gateway Setup Helper
+# Sets up the Kiro proxy for Claude Sonnet Kiro integration
+#
+
+KIRO_DIR="$HOME/kiro-gateway"
+KIRO_REPO="https://github.com/jwadow/kiro-gateway"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+print_status() {
+    echo -e "${BLUE}[*]${NC} $1"
+}
+
+print_success() {
+    echo -e "${GREEN}[✓]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[✗]${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[!]${NC} $1"
+}
+
+check_dependencies() {
+    print_status "Checking dependencies..."
+    
+    if ! command -v git &> /dev/null; then
+        print_error "git is required"
+        exit 1
+    fi
+    
+    if ! command -v node &> /dev/null; then
+        print_error "Node.js is required"
+        exit 1
+    fi
+    
+    # Check for pnpm or npm
+    if command -v pnpm &> /dev/null; then
+        PKG_MANAGER="pnpm"
+    elif command -v npm &> /dev/null; then
+        PKG_MANAGER="npm"
+    else
+        print_error "npm or pnpm is required"
+        exit 1
+    fi
+    
+    print_success "Using $PKG_MANAGER"
+}
+
+clone_kiro() {
+    if [ -d "$KIRO_DIR" ]; then
+        print_warning "Kiro gateway already exists at $KIRO_DIR"
+        read -p "Update? (y/n) " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            cd "$KIRO_DIR"
+            git pull
+        fi
+    else
+        print_status "Cloning Kiro gateway..."
+        git clone "$KIRO_REPO" "$KIRO_DIR"
+    fi
+}
+
+install_dependencies() {
+    print_status "Installing dependencies..."
+    cd "$KIRO_DIR"
+    $PKG_MANAGER install
+}
+
+create_env() {
+    if [ ! -f "$KIRO_DIR/.env" ]; then
+        print_status "Creating .env file..."
+        cat > "$KIRO_DIR/.env" << 'EOF'
+# Kiro Gateway Configuration
+PORT=8787
+# Add your Anthropic API key here
+# ANTHROPIC_API_KEY=your-key-here
+EOF
+        print_warning "Please edit $KIRO_DIR/.env and add your Anthropic API key"
+    fi
+}
+
+print_next_steps() {
+    echo ""
+    print_success "Kiro Gateway setup complete!"
+    echo ""
+    echo "Next steps:"
+    echo "  1. Edit $KIRO_DIR/.env and add your Anthropic API key"
+    echo "  2. Start Kiro proxy: vkm kiro-start"
+    echo "  3. Or enable auto-start: vkm kiro-enable"
+    echo ""
+    echo "Usage with VKM:"
+    echo "  vkm key-add  # Add your keys, select 'kiro' service"
+    echo "  vkm status   # Check if Kiro is running"
+    echo ""
+}
+
+# Main
+main() {
+    echo -e "${BLUE}Kiro Gateway Setup${NC}"
+    echo ""
+    
+    check_dependencies
+    clone_kiro
+    install_dependencies
+    create_env
+    
+    print_next_steps
+}
+
+main
