@@ -1,0 +1,50 @@
+{
+  "name": "vkm",
+  "version": "2.0.1",
+  "description": "Virtual Key Manager - General-purpose API key manager with adaptive integrations, organized cycles, and background monitoring",
+  "main": "bin/vkm",
+  "bin": {
+    "vkm": "./bin/vkm"
+  },
+  "scripts": {
+    "start": "node bin/vkm",
+    "test": "node bin/vkm --help",
+    "lint": "echo 'No linting configured'"
+  },
+  "keywords": [
+    "api-key",
+    "key-manager",
+    "key-rotation",
+    "openrouter",
+    "anthropic",
+    "openai",
+    "groq",
+    "kiro",
+    "monitor",
+    "cli"
+  ],
+  "author": "VKM Team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/vkm"
+  },
+  "bugs": {
+    "url": "https://github.com/yourusername/vkm/issues"
+  },
+  "homepage": "https://github.com/yourusername/vkm#readme",
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "files": [
+    "bin/",
+    "systemd/",
+    "install.sh",
+    "install-complete.sh",
+    "setup.sh"
+  ],
+  "dependencies": {},
+  "devDependencies": {},
+  "os": ["linux", "darwin"],
+  "preferGlobal": true
+}

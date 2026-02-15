@@ -311,6 +311,10 @@ async function checkKeyHealth(serviceId, apiKey, customUrl = null) {
     return { healthy: false, status: 'unknown_service', error: `Unknown service: ${serviceId}` };
   }
 
+  if (!apiKey || typeof apiKey !== 'string' || apiKey.trim().length === 0) {
+    return { healthy: false, status: 'invalid_key', error: 'API key is empty or invalid' };
+  }
+
   const baseUrl = customUrl || service.defaultUrl;
   const healthUrl = `${baseUrl}${service.healthEndpoint || '/models'}`;
   
@@ -320,7 +324,7 @@ async function checkKeyHealth(serviceId, apiKey, customUrl = null) {
       [service.authHeader]: `${service.authPrefix}${apiKey}`,
       'Content-Type': 'application/json'
     },
-    timeout: 10000
+    timeout: 15000
   };
 
   try {
@@ -329,13 +333,16 @@ async function checkKeyHealth(serviceId, apiKey, customUrl = null) {
     if (response.statusCode === 200) {
       let usage = null;
       
-      // Try to get usage info if supported
       if (service.supportsUsageCheck && service.usageEndpoint) {
         try {
           const usageUrl = `${baseUrl}${service.usageEndpoint}`;
           const usageResponse = await makeRequest(usageUrl, options);
           if (usageResponse.statusCode === 200) {
-            usage = JSON.parse(usageResponse.body);
+            try {
+              usage = JSON.parse(usageResponse.body);
+            } catch (parseErr) {
+              usage = { raw: usageResponse.body };
+            }
           }
         } catch (e) {
           // Usage check failed but key is still healthy
@@ -348,18 +355,34 @@ async function checkKeyHealth(serviceId, apiKey, customUrl = null) {
         usage,
         headers: response.headers 
       };
-    } else if (response.statusCode === 401) {
-      return { healthy: false, status: 'invalid', error: 'Invalid API key' };
+    } else if (response.statusCode === 401 || response.statusCode === 403) {
+      return { healthy: false, status: 'invalid', error: 'Invalid or unauthorized API key' };
     } else if (response.statusCode === 429) {
-      return { healthy: false, status: 'rate_limited', error: 'Rate limited' };
+      return { healthy: true, status: 'rate_limited', warning: 'Rate limited but key is valid' };
+    } else if (response.statusCode === 404 && serviceId === 'anthropic') {
+      // Anthropic doesn't have /models endpoint, try a minimal request
+      return await testChatCompletion(serviceId, apiKey, customUrl);
     } else {
-      return { healthy: false, status: 'error', error: `HTTP ${response.statusCode}` };
+      const errorBody = response.body ? safeParseJSON(response.body) : null;
+      const errorMsg = errorBody?.error?.message || errorBody?.message || `HTTP ${response.statusCode}`;
+      return { healthy: false, status: 'error', error: errorMsg };
     }
   } catch (error) {
     if (service.isProxy) {
       return { healthy: false, status: 'proxy_offline', error: error.message };
     }
+    if (error.message === 'Request timeout') {
+      return { healthy: false, status: 'timeout', error: 'Request timed out' };
+    }
     return { healthy: false, status: 'network_error', error: error.message };
+  }
+}
+
+function safeParseJSON(str) {
+  try {
+    return JSON.parse(str);
+  } catch {
+    return null;
   }
 }
 
@@ -389,7 +412,7 @@ async function testChatCompletion(serviceId, apiKey, customUrl = null) {
       'Content-Length': Buffer.byteLength(body)
     },
     body,
-    timeout: 15000
+    timeout: 20000
   };
 
   try {
@@ -398,18 +421,28 @@ async function testChatCompletion(serviceId, apiKey, customUrl = null) {
     if (response.statusCode === 200) {
       return { healthy: true, status: 'active' };
     } else if (response.statusCode === 429) {
-      return { healthy: false, status: 'rate_limited' };
-    } else if (response.statusCode === 401) {
-      return { healthy: false, status: 'invalid' };
+      return { healthy: true, status: 'rate_limited', warning: 'Rate limited but key is valid' };
+    } else if (response.statusCode === 401 || response.statusCode === 403) {
+      return { healthy: false, status: 'invalid', error: 'Authentication failed' };
     } else {
       try {
-        const error = JSON.parse(response.body);
-        return { healthy: false, status: 'error', error: error.error?.message || response.body };
+        const errorData = JSON.parse(response.body);
+        const errorMsg = errorData.error?.message || errorData.message || response.body;
+        
+        // Some services return errors for test calls but key is valid
+        if (errorMsg.includes('quota') || errorMsg.includes('billing')) {
+          return { healthy: true, status: 'quota_exceeded', warning: errorMsg };
+        }
+        
+        return { healthy: false, status: 'error', error: errorMsg };
       } catch {
-        return { healthy: false, status: 'error', error: response.body };
+        return { healthy: false, status: 'error', error: `HTTP ${response.statusCode}` };
       }
     }
   } catch (error) {
+    if (error.message === 'Request timeout') {
+      return { healthy: false, status: 'timeout', error: 'Request timed out' };
+    }
     return { healthy: false, status: 'network_error', error: error.message };
   }
 }
@@ -517,10 +550,16 @@ async function rotateKey(serviceId, options = {}) {
   let attempts = 0;
   let rotated = false;
   let newKey = null;
+  const errors = [];
 
   while (attempts < serviceKeys.length) {
     const nextIndex = (currentIndex + attempts + 1) % serviceKeys.length;
     const keyData = serviceKeys[nextIndex];
+    
+    if (!keyData || !keyData.key) {
+      attempts++;
+      continue;
+    }
     
     log(`Testing key ${nextIndex + 1}/${serviceKeys.length}: ${keyData.name || 'Unnamed'}`);
     
@@ -529,18 +568,28 @@ async function rotateKey(serviceId, options = {}) {
     if (health.healthy || options.force) {
       state.currentKeyIndex[serviceId] = nextIndex;
       state.lastRotation[serviceId] = new Date().toISOString();
-      state.keyHealth[serviceId] = { status: 'healthy', checkedAt: new Date().toISOString() };
+      state.keyHealth[serviceId] = { 
+        status: health.healthy ? 'healthy' : health.status, 
+        checkedAt: new Date().toISOString(),
+        ...(health.warning && { warning: health.warning })
+      };
       saveState(state);
       
-      // Update integrations
       const service = loadServices()[serviceId];
       const url = keyData.customUrl || service?.defaultUrl;
       
       if (config.integrations) {
         for (const integrationId of config.integrations) {
-          if (INTEGRATIONS[integrationId]?.supportedServices.includes(serviceId) || 
-              INTEGRATIONS[integrationId]?.supportedServices.includes('*')) {
-            updateIntegration(integrationId, serviceId, keyData.key, url);
+          const integration = INTEGRATIONS[integrationId];
+          if (!integration) continue;
+          
+          if (integration.supportedServices.includes(serviceId) || 
+              integration.supportedServices.includes('*')) {
+            try {
+              updateIntegration(integrationId, serviceId, keyData.key, url);
+            } catch (intErr) {
+              log(`Failed to update ${integrationId}: ${intErr.message}`, 'warn');
+            }
           }
         }
       }
@@ -550,14 +599,22 @@ async function rotateKey(serviceId, options = {}) {
       log(`Rotated to key: ${keyData.name || 'Unnamed'} (${serviceId})`);
       break;
     } else {
-      log(`Key ${keyData.name || 'Unnamed'} unhealthy: ${health.status}`, 'warn');
+      const statusMsg = health.status || 'unknown';
+      const errorMsg = health.error || 'No error message';
+      errors.push(`${keyData.name || 'Unnamed'}: ${statusMsg} - ${errorMsg}`);
+      log(`Key ${keyData.name || 'Unnamed'} unhealthy: ${statusMsg}`, 'warn');
     }
     
     attempts++;
   }
 
   if (!rotated) {
-    return { success: false, error: 'No healthy keys available' };
+    return { 
+      success: false, 
+      error: 'No healthy keys available',
+      errors,
+      triedKeys: attempts
+    };
   }
 
   return { success: true, key: newKey, service: serviceId };
@@ -1438,29 +1495,91 @@ WantedBy=default.target
 
   // TUI - Node-based Visual Editor
   async tui() {
-    const tuiPath = path.join(__dirname, '..', 'vkm-tui', 'bin', 'vkm-tui');
+    // Check multiple possible TUI locations
+    const possiblePaths = [
+      path.join(__dirname, '..', 'vkm-tui', 'bin', 'vkm-tui'),
+      path.join(process.env.HOME, '.vkm', 'vkm-tui', 'bin', 'vkm-tui'),
+      path.join(process.env.HOME, '.local', 'bin', 'vkm-tui'),
+      '/usr/local/bin/vkm-tui'
+    ];
+    
+    let tuiPath = null;
+    for (const p of possiblePaths) {
+      if (fs.existsSync(p)) {
+        tuiPath = p;
+        break;
+      }
+    }
+    
+    // Check if vkm-tui command is available in PATH
+    if (!tuiPath) {
+      try {
+        const whichResult = await new Promise((resolve, reject) => {
+          exec('which vkm-tui', (error, stdout) => {
+            if (error) reject(error);
+            else resolve(stdout.trim());
+          });
+        });
+        if (whichResult && fs.existsSync(whichResult)) {
+          tuiPath = whichResult;
+        }
+      } catch (e) {
+        // vkm-tui not in PATH
+      }
+    }
     
     // Check if vkm-tui is installed
-    if (!fs.existsSync(tuiPath)) {
-      console.log('🎨 VKM TUI not installed. Installing...');
+    if (!tuiPath) {
+      console.log('🎨 VKM TUI not found. Attempting to install...');
       
-      const vkmTuiDir = path.join(__dirname, '..', 'vkm-tui');
+      const vkmTuiDir = path.join(process.env.HOME, '.vkm', 'vkm-tui');
       
-      // Create vkm-tui directory structure
-      if (!fs.existsSync(vkmTuiDir)) {
-        fs.mkdirSync(vkmTuiDir, { recursive: true });
-        fs.mkdirSync(path.join(vkmTuiDir, 'src'), { recursive: true });
-        fs.mkdirSync(path.join(vkmTuiDir, 'bin'), { recursive: true });
-        fs.mkdirSync(path.join(vkmTuiDir, 'templates'), { recursive: true });
+      // Check if source exists
+      const sourceDir = path.join(__dirname, '..', 'vkm-tui');
+      if (fs.existsSync(sourceDir)) {
+        console.log('Installing TUI from source...');
+        
+        // Copy TUI files
+        if (!fs.existsSync(vkmTuiDir)) {
+          fs.mkdirSync(vkmTuiDir, { recursive: true });
+        }
+        
+        // Copy files using cp -r
+        await new Promise((resolve, reject) => {
+          exec(`cp -r "${sourceDir}"/* "${vkmTuiDir}/"`, (error) => {
+            if (error) reject(error);
+            else resolve();
+          });
+        });
+        
+        // Install dependencies
+        console.log('Installing TUI dependencies...');
+        await new Promise((resolve, reject) => {
+          exec('npm install --silent', { cwd: vkmTuiDir }, (error) => {
+            if (error) reject(error);
+            else resolve();
+          });
+        });
+        
+        tuiPath = path.join(vkmTuiDir, 'bin', 'vkm-tui');
+        console.log('✓ VKM TUI installed');
+      } else {
+        console.log('');
+        console.log('VKM TUI is not installed. Install options:');
+        console.log('');
+        console.log('  Option 1: Install from npm');
+        console.log('    npm install -g vkm-tui');
+        console.log('');
+        console.log('  Option 2: Install from source');
+        console.log('    git clone https://github.com/yourusername/vkm.git');
+        console.log('    cd vkm/vkm-tui && npm install');
+        console.log('');
+        console.log('  Option 3: Use CLI commands instead');
+        console.log('    vkm key-add        # Add keys');
+        console.log('    vkm key-list       # List keys');
+        console.log('    vkm template-list  # See templates');
+        return;
       }
-      
-      console.log('✓ VKM TUI directory created');
-      console.log('');
-      console.log('Please install vkm-tui from:');
-      console.log('  ' + path.join(__dirname, '..', 'vkm-tui'));
-      console.log('');
-      console.log('Or run: npm install neo-blessed in the vkm-tui directory');
-      return;
     }
     
     // Launch the TUI
@@ -1468,7 +1587,11 @@ WantedBy=default.target
     
     const child = spawn('node', [tuiPath], {
       stdio: 'inherit',
-      detached: false
+      detached: false,
+      env: {
+        ...process.env,
+        VKM_HOME: CONFIG_DIR
+      }
     });
     
     child.on('close', (code) => {
@@ -1721,15 +1844,64 @@ if (!fs.existsSync(CONFIG_DIR)) {
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
 }
 
+const VERSION = '2.0.1';
+
 // Main entry
 const [,, command, ...args] = process.argv;
 
-if (!command || !commands[command]) {
+// Handle version flag
+if (command === '--version' || command === '-v' || command === 'version') {
+  console.log(`vkm ${VERSION}`);
+  process.exit(0);
+}
+
+// Map command variations
+const commandAliases = {
+  'key-add': 'key_add',
+  'key-list': 'key_list', 
+  'key-check': 'key_check',
+  'key-remove': 'key_remove',
+  'service-add': 'service_add',
+  'service-list': 'service_list',
+  'cycle-create': 'cycle_create',
+  'cycle-list': 'cycle_list',
+  'cycle-activate': 'cycle_activate',
+  'cycle-next': 'cycle_next',
+  'cycle-history': 'cycle_history',
+  'integration-list': 'integration_list',
+  'integration-enable': 'integration_enable',
+  'integration-disable': 'integration_disable',
+  'kiro-status': 'kiro_status',
+  'kiro-start': 'kiro_start',
+  'kiro-stop': 'kiro_stop',
+  'kiro-enable': 'kiro_enable',
+  'kiro-disable': 'kiro_disable',
+  'monitor-stop': 'monitor_stop',
+  'monitor-status': 'monitor_status',
+  'config-set': 'config_set',
+  'session-list': 'session_list',
+  'session-create': 'session_create',
+  'session-start': 'session_start',
+  'session-stop': 'session_stop',
+  'graph-save': 'graph_save',
+  'graph-load': 'graph_load',
+  'graph-export': 'graph_export',
+  'template-list': 'template_list',
+  'template-apply': 'template_apply'
+};
+
+const resolvedCommand = commandAliases[command] || command;
+
+if (!command || !commands[resolvedCommand]) {
   commands.help();
   process.exit(0);
 }
 
-Promise.resolve().then(() => commands[command](args)).catch(err => {
+Promise.resolve().then(() => commands[resolvedCommand](args)).catch(err => {
+  console.error(`\x1b[31mError:\x1b[0m ${err.message}`);
+  if (process.env.VKM_DEBUG) {
+    console.error(err.stack);
+  }
   log(err.message, 'error');
   process.exit(1);
 });

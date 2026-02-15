@@ -10,6 +10,8 @@ const blessed = require('neo-blessed');
 const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
+const GraphEngine = require('./graph-engine');
+const SessionManager = require('./session-manager');
 
 // Configuration paths
 const VKM_DIR = path.join(process.env.HOME, '.vkm');

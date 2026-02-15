@@ -1,6 +1,6 @@
 {
   "name": "vkm-tui",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Node-based visual editor for VKM - Jack Audio style connection manager",
   "main": "src/vkm-tui.js",
   "bin": {
@@ -8,8 +8,8 @@
   },
   "scripts": {
     "start": "node bin/vkm-tui",
-    "install-deps": "npm install",
-    "test": "node test/test.js"
+    "install-deps": "npm install neo-blessed",
+    "test": "node -e \"require('./src/vkm-tui.js')\""
   },
   "keywords": [
     "vkm",
@@ -17,18 +17,32 @@
     "terminal-ui",
     "node-editor",
     "jack-audio",
-    "visual-programming"
+    "visual-programming",
+    "tui",
+    "cli"
   ],
   "author": "VKM Team",
   "license": "MIT",
   "dependencies": {
     "neo-blessed": "^0.2.20"
   },
+  "devDependencies": {},
   "engines": {
     "node": ">=16.0.0"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/yourusername/vkm-tui"
-  }
+    "url": "https://github.com/yourusername/vkm.git",
+    "directory": "vkm-tui"
+  },
+  "bugs": {
+    "url": "https://github.com/yourusername/vkm/issues"
+  },
+  "homepage": "https://github.com/yourusername/vkm#readme",
+  "files": [
+    "bin/",
+    "src/",
+    "templates/"
+  ],
+  "os": ["linux", "darwin"]
 }
