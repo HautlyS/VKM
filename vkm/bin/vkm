@@ -112,7 +112,33 @@ const DEFAULT_SERVICES = {
     requiresProxy: true,
     proxyRepo: 'https://github.com/jwadow/kiro-gateway',
     proxySetup: 'kiro-setup'
+  },
+  modal: {
+    name: 'Modal GLM-5',
+    description: 'Modal direct endpoint for GLM-5 model',
+    defaultUrl: 'https://api.us-west-2.modal.direct/v1',
+    keyPrefix: 'modalresearch_',
+    healthEndpoint: '/chat/completions',
+    authHeader: 'Authorization',
+    authPrefix: 'Bearer ',
+    models: ['zai-org/GLM-5-FP8'],
+    testModel: 'zai-org/GLM-5-FP8',
+    testMaxTokens: 5,
+    supportsUsageCheck: false,
+    priority: 1,
+    isPrimary: true,
+    usePostForHealth: true
   }
+};
+
+const SERVICE_PRIORITY = {
+  modal: 1,
+  openrouter: 2,
+  anthropic: 3,
+  openai: 4,
+  groq: 5,
+  kiro: 6,
+  openclaw: 7
 };
 
 // Integration definitions
@@ -316,6 +342,12 @@ async function checkKeyHealth(serviceId, apiKey, customUrl = null) {
   }
 
   const baseUrl = customUrl || service.defaultUrl;
+  
+  // For services that need POST for health check (like Modal)
+  if (service.usePostForHealth) {
+    return await testChatCompletion(serviceId, apiKey, customUrl);
+  }
+  
   const healthUrl = `${baseUrl}${service.healthEndpoint || '/models'}`;
   
   const options = {
@@ -744,6 +776,100 @@ function getNextInCycle(cycleName) {
   };
 }
 
+async function getActiveKeyByPriority() {
+  const keys = loadKeys();
+  const state = loadState();
+  const sortedServices = Object.entries(SERVICE_PRIORITY)
+    .sort((a, b) => a[1] - b[1])
+    .map(([service]) => service);
+
+  for (const serviceId of sortedServices) {
+    if (!keys[serviceId] || keys[serviceId].length === 0) continue;
+    
+    const serviceKeys = keys[serviceId];
+    const currentIndex = state.currentKeyIndex?.[serviceId] || 0;
+    
+    for (let i = 0; i < serviceKeys.length; i++) {
+      const idx = (currentIndex + i) % serviceKeys.length;
+      const keyData = serviceKeys[idx];
+      
+      if (!keyData || !keyData.key) continue;
+      
+      const health = await checkKeyHealth(serviceId, keyData.key, keyData.customUrl);
+      
+      if (health.healthy) {
+        state.currentKeyIndex[serviceId] = idx;
+        state.lastRotation[serviceId] = new Date().toISOString();
+        state.keyHealth[serviceId] = {
+          status: 'healthy',
+          checkedAt: new Date().toISOString()
+        };
+        saveState(state);
+        
+        return {
+          service: serviceId,
+          key: keyData.key,
+          name: keyData.name,
+          health,
+          provider: serviceId === 'modal' ? 'Modal GLM-5' : serviceId
+        };
+      }
+    }
+  }
+  
+  return null;
+}
+
+async function batchImportKeys(filePath) {
+  if (!fs.existsSync(filePath)) {
+    return { success: false, error: `File not found: ${filePath}` };
+  }
+
+  const content = fs.readFileSync(filePath, 'utf8');
+  const lines = content.split('\n');
+  const keys = loadKeys();
+  
+  let modalCount = 0;
+  let openrouterCount = 0;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    
+    if (trimmed.startsWith('modalresearch_')) {
+      if (!keys.modal) keys.modal = [];
+      const exists = keys.modal.find(k => k.key === trimmed);
+      if (!exists) {
+        keys.modal.push({
+          name: `Modal GLM-5 #${keys.modal.length + 1}`,
+          key: trimmed,
+          addedAt: new Date().toISOString()
+        });
+        modalCount++;
+      }
+    } else if (trimmed.startsWith('sk-or-v1-')) {
+      if (!keys.openrouter) keys.openrouter = [];
+      const exists = keys.openrouter.find(k => k.key === trimmed);
+      if (!exists) {
+        keys.openrouter.push({
+          name: `OpenRouter #${keys.openrouter.length + 1}`,
+          key: trimmed,
+          addedAt: new Date().toISOString()
+        });
+        openrouterCount++;
+      }
+    }
+  }
+
+  saveKeys(keys);
+  
+  return {
+    success: true,
+    modal: modalCount,
+    openrouter: openrouterCount,
+    total: modalCount + openrouterCount
+  };
+}
+
 // Background monitor
 async function monitorDaemon() {
   const config = loadConfig();
@@ -1097,6 +1223,70 @@ const commands = {
       console.log(`✓ Rotated to: ${result.key.name}`);
     } else {
       console.error(`✗ Rotation failed: ${result.error}`);
+    }
+  },
+
+  async batch_import(args) {
+    const filePath = args[0] || path.join(process.env.HOME, 'keys', 'keys.txt');
+    console.log(`📦 Batch importing keys from: ${filePath}`);
+    
+    const result = await batchImportKeys(filePath);
+    
+    if (result.success) {
+      console.log(`\n✓ Import complete:`);
+      console.log(`  Modal GLM-5: ${result.modal} keys`);
+      console.log(`  OpenRouter: ${result.openrouter} keys`);
+      console.log(`  Total: ${result.total} keys added`);
+      
+      if (result.total > 0) {
+        console.log('\n🔄 Activating primary key...');
+        const active = await getActiveKeyByPriority();
+        if (active) {
+          console.log(`✓ Active: ${active.provider} - ${active.name}`);
+        } else {
+          console.log('⚠️  No healthy keys found');
+        }
+      }
+    } else {
+      console.error(`✗ ${result.error}`);
+    }
+  },
+
+  async get_active() {
+    const active = await getActiveKeyByPriority();
+    
+    if (active) {
+      console.log(JSON.stringify({
+        service: active.service,
+        key: active.key,
+        name: active.name,
+        provider: active.provider,
+        healthy: true
+      }));
+    } else {
+      console.log(JSON.stringify({
+        healthy: false,
+        error: 'No healthy keys available'
+      }));
+    }
+  },
+
+  async get_config() {
+    const active = await getActiveKeyByPriority();
+    const services = loadServices();
+    
+    if (active) {
+      const service = services[active.service];
+      console.log(JSON.stringify({
+        APIKEY: active.key,
+        BASEURL: service?.defaultUrl || '',
+        MODEL: service?.testModel || '',
+        PROVIDER: active.service
+      }));
+    } else {
+      console.log(JSON.stringify({
+        error: 'No healthy keys available'
+      }));
     }
   },
 
@@ -1770,6 +1960,11 @@ USAGE: vkm <command> [args]
   key-check         Check health of all keys
   key-remove        Remove a key
   rotate [service]  Rotate to next healthy key (default: openrouter)
+  batch-import [file] Batch import keys from file (default: ~/keys/keys.txt)
+
+🎯 PRIORITY SYSTEM (Modal GLM-5 primary, OpenRouter fallback):
+  get-active        Get active healthy key (JSON output)
+  get-config        Get config for integrations (JSON output)
 
 🏢 SERVICE MANAGEMENT:
   service-add       Add a custom service definition
@@ -1821,18 +2016,23 @@ USAGE: vkm <command> [args]
 
 EXAMPLES:
   vkm init
-  vkm tui                    # Visual node editor
+  vkm batch-import                        # Import from ~/keys/keys.txt
+  vkm batch-import /path/to/keys.txt      # Import from custom file
+  vkm get-active                          # Get active key (for apps)
+  vkm get-config                          # Get config (for integrations)
+  vkm tui                                 # Visual node editor
   vkm key-add
-  vkm rotate openrouter
-  vkm template-apply kiro-proxy-4.5
+  vkm rotate modal                        # Rotate Modal GLM-5 key
   vkm monitor
 
-TEMPLATES (in TUI, press number keys):
-  1: ALL GLM-5 MODAL
-  2: ALL KIRO PROXY 4.5
-  3: Multi-Model Ensemble
-  4: Fallback Chain
-  5: Round Robin Load Balancer
+SERVICE PRIORITY (for get-active):
+  1. Modal GLM-5 (primary)
+  2. OpenRouter (fallback)
+  3. Anthropic
+  4. OpenAI
+  5. Groq
+  6. Kiro
+  7. OpenClaw
 
 CONFIG LOCATION: ${CONFIG_DIR}
 `);
@@ -1887,7 +2087,10 @@ const commandAliases = {
   'graph-load': 'graph_load',
   'graph-export': 'graph_export',
   'template-list': 'template_list',
-  'template-apply': 'template_apply'
+  'template-apply': 'template_apply',
+  'batch-import': 'batch_import',
+  'get-active': 'get_active',
+  'get-config': 'get_config'
 };
 
 const resolvedCommand = commandAliases[command] || command;
